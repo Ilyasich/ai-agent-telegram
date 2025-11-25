@@ -56,3 +56,70 @@ async def get_messages(timeframe):
             
         rows = await cursor.fetchall()
         return rows
+
+async def search_messages(query=None, username=None, limit=50, exclude_user_id=None):
+    """
+    Search messages by keywords and/or username.
+    
+    Args:
+        query: Text to search for. If "" or "LATEST", returns most recent messages.
+        username: Filter by specific username
+        limit: Maximum number of results (default 50)
+        exclude_user_id: ID of user to exclude (to avoid self-referencing)
+        
+    Returns:
+        List of tuples: (username, text, created_at)
+    """
+    async with aiosqlite.connect(config.DB_NAME) as db:
+        conditions = []
+        params = []
+        
+        # 1. Exclude User ID (Critical for "Show me news" queries)
+        if exclude_user_id:
+            conditions.append("user_id != ?")
+            params.append(exclude_user_id)
+            
+        # 2. Handle "LATEST" or Empty Query
+        is_latest_search = not query or query.strip() == "" or query == "LATEST" or query == "LATEST_5"
+        
+        if is_latest_search:
+            # For latest news, we just want the most recent items
+            # We still respect exclude_user_id
+            where_clause = " WHERE " + " AND ".join(conditions) if conditions else ""
+            
+            sql = f"""
+                SELECT username, text, created_at FROM messages
+                {where_clause}
+                ORDER BY id DESC
+                LIMIT ?
+            """
+            params.append(limit) # Use the limit passed in
+            
+            cursor = await db.execute(sql, params)
+            rows = await cursor.fetchall()
+            return rows
+
+        # 3. Normal Keyword Search
+        if query and query.strip():
+            conditions.append("text LIKE ?")
+            params.append(f"%{query}%")
+            
+        if username:
+            conditions.append("username LIKE ?")
+            params.append(f"%{username}%")
+        
+        # Build WHERE clause
+        where_clause = " AND ".join(conditions) if conditions else "1=1"
+        
+        sql = f"""
+            SELECT username, text, created_at FROM messages
+            WHERE {where_clause}
+            ORDER BY created_at DESC
+            LIMIT ?
+        """
+        
+        params.append(limit)
+        
+        cursor = await db.execute(sql, params)
+        rows = await cursor.fetchall()
+        return rows

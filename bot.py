@@ -122,6 +122,34 @@ async def cmd_summary(message: types.Message, bot: Bot):
 
     await process_summary_request(message, timeframe, bot)
 
+@router.channel_post()
+async def log_channel_posts(message: types.Message):
+    """
+    Log all posts from channels where the bot is admin.
+    Captures text or caption. Handles media groups (albums) by ignoring empty captions.
+    Channels don't have individual users, so we use chat.title as username.
+    """
+    try:
+        # 1. Universal Text Extraction
+        content = message.text or message.caption or ""
+        
+        # 2. Debug Print
+        print(f"--- NEW POST IN {message.chat.title}: {content[:20]}... ---")
+        
+        # 3. Handle Albums & Empty Content
+        if not content.strip():
+            return
+
+        # 4. Save to DB
+        # Use chat.id and chat.title because from_user might be None in channels
+        await db.log_message(
+            user_id=message.chat.id,
+            username=message.chat.title or "Channel",
+            text=content
+        )
+    except Exception as e:
+        logging.error(f"Error in log_channel_posts: {e}")
+
 def should_respond_to_message(message: types.Message, bot_username: str) -> bool:
     """
     Determine if the bot should respond to this message.
@@ -155,47 +183,87 @@ def should_respond_to_message(message: types.Message, bot_username: str) -> bool
 @router.message(F.text)
 async def log_all_messages(message: types.Message, bot: Bot):
     """
-    Log all text messages and handle natural language interactions.
+    Log all text messages and handle interactions.
+    Supports Replies and Forwards as Context.
     """
-    # Ignore commands (they're handled by specific handlers)
+    # Ignore commands
     if message.text.startswith('/'):
         return
 
-    # Log message to database
+    # 1. Log User Message to DB
+    # Handle cases where from_user might be None (though rare in message handler)
+    user_id = message.from_user.id if message.from_user else message.chat.id
+    username = message.from_user.username if message.from_user else "Unknown"
+    
     await db.log_message(
-        user_id=message.from_user.id,
-        username=message.from_user.username or "Unknown",
+        user_id=user_id,
+        username=username,
         text=message.text
     )
     
-    # Get bot username for mention detection
+    # 2. Check if Bot Should Respond
     bot_info = await bot.get_me()
-    bot_username = bot_info.username
-    
-    # Check if bot should respond
-    if not should_respond_to_message(message, bot_username):
+    if not should_respond_to_message(message, bot_info.username):
         return
     
-    # Detect user intent using AI
+    # 3. Context Extraction (Reply or Forward)
+    context_text = None
+    
+    # Check for Reply
+    if message.reply_to_message:
+        # Extract text/caption from the replied message
+        replied_msg = message.reply_to_message
+        context_text = replied_msg.text or replied_msg.caption or ""
+        
+    # Check for Forward (if it's a forward, the message itself has forward_date)
+    # But usually users forward a message AND add a comment, which makes it a reply? 
+    # Or they just forward it. If they just forward, message.text is the content.
+    # If they reply TO a forward, handled above.
+    
+    # 4. Detect Intent
+    status_msg = await message.reply("🤔 Анализирую...")
+    
     try:
         intent = await ai_service.detect_intent(message.text)
         
         if intent["action"] == "summary":
-            # User wants a summary
             timeframe = intent.get("timeframe", "1h")
+            await status_msg.delete() # Remove "Analyzing"
             await process_summary_request(message, timeframe, bot)
             
-        elif intent["action"] == "chat":
-            # User wants to chat
-            reply_text = intent.get("reply", "I'm here to help!")
-            await message.reply(reply_text)
-        else:
-            # Unknown action
-            await message.reply("Не уверен, как помочь с этим. Попробуйте попросить сводку или используйте команду /summary!")
+        elif intent["action"] == "search":
+            keywords = intent.get("keywords", "")
+            username_filter = intent.get("username")
+            
+            # If we have direct context (Reply), we might skip DB search or combine it
+            # But the requirement says: "If YES: Extract text... pass as Context"
+            
+            found_messages = []
+            
+            if not context_text:
+                # Perform DB Search
+                # If keywords is empty, db.search_messages handles it as "LATEST"
+                limit = 5
+                found_messages = await db.search_messages(
+                    query=keywords,
+                    username=username_filter,
+                    limit=limit,
+                    exclude_user_id=user_id # Exclude the current user's messages
+                )
+            
+            # Generate Answer
+            answer = await ai_service.answer_search_query(
+                user_question=message.text,
+                found_messages=found_messages,
+                context_text=context_text
+            )
+            
+            await status_msg.delete()
+            await message.reply(answer)
             
     except Exception as e:
-        logging.error(f"Error in intent detection: {e}")
-        await message.reply("Извините, произошла ошибка. Попробуйте использовать команду /summary.")
+        logging.error(f"Error in log_all_messages: {e}")
+        await status_msg.edit_text("⚠️ Произошла ошибка. Попробуйте позже.")
 
 async def main():
     # Initialize Bot and Dispatcher
