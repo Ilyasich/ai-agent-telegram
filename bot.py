@@ -180,14 +180,17 @@ def should_respond_to_message(message: types.Message, bot_username: str) -> bool
     
     return False
 
-@router.message(F.text)
+@router.message(F.text | F.caption)
 async def log_all_messages(message: types.Message, bot: Bot):
     """
     Log all text messages and handle interactions.
     Supports Replies and Forwards as Context.
     """
-    # Ignore commands
-    if message.text.startswith('/'):
+    # Extract content (text or caption)
+    content = message.text or message.caption or ""
+    
+    # Ignore commands and empty messages
+    if not content or content.startswith('/'):
         return
 
     # 1. Log User Message to DB
@@ -198,7 +201,7 @@ async def log_all_messages(message: types.Message, bot: Bot):
     await db.log_message(
         user_id=user_id,
         username=username,
-        text=message.text
+        text=content
     )
     
     # 2. Check if Bot Should Respond
@@ -224,7 +227,7 @@ async def log_all_messages(message: types.Message, bot: Bot):
     status_msg = await message.reply("🤔 Анализирую...")
     
     try:
-        intent = await ai_service.detect_intent(message.text)
+        intent = await ai_service.detect_intent(content)
         
         if intent["action"] == "summary":
             timeframe = intent.get("timeframe", "1h")
@@ -253,7 +256,7 @@ async def log_all_messages(message: types.Message, bot: Bot):
             
             # Generate Answer
             answer = await ai_service.answer_search_query(
-                user_question=message.text,
+                user_question=content,
                 found_messages=found_messages,
                 context_text=context_text
             )
