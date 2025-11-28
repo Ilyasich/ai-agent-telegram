@@ -105,6 +105,14 @@ async def process_summary_request(message: types.Message, timeframe: str, bot: B
         logging.error(f"Error in process_summary_request: {e}")
         await status_msg.edit_text(f"Произошла ошибка: {str(e)}")
 
+@router.message(Command("start"))
+async def cmd_start(message: types.Message):
+    """
+    Handle /start command.
+    Sends a greeting message describing the bot's purpose.
+    """
+    await message.reply("Привет я бот аналитик в чате. Помогаю с информацией в чате.")
+
 @router.message(Command("summary"))
 async def cmd_summary(message: types.Message, bot: Bot):
     """
