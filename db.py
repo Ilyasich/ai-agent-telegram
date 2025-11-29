@@ -4,23 +4,44 @@ import config
 
 async def init_db():
     async with aiosqlite.connect(config.DB_NAME) as db:
+        # Check if table exists and has chat_id
+        # For simplicity in this upgrade, we'll create if not exists, 
+        # but since we want to enforce the new schema, we might need to handle migration.
+        # Given the previous "delete all data" instruction, we can be a bit aggressive 
+        # but let's try to be safe: create table with new schema if it doesn't exist.
+        # If it exists without chat_id, it might fail on insert. 
+        # Ideally we'd check columns, but for this task let's assume we can recreate or the user handles it.
+        # Actually, let's just create it correctly.
         await db.execute("""
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER,
                 user_id INTEGER,
                 username TEXT,
                 text TEXT,
                 created_at DATETIME
             )
         """)
+        
+        # Optional: Check if chat_id column exists (simple migration)
+        try:
+            await db.execute("SELECT chat_id FROM messages LIMIT 1")
+        except Exception:
+            # Column likely missing, try to add it
+            try:
+                await db.execute("ALTER TABLE messages ADD COLUMN chat_id INTEGER")
+            except Exception as e:
+                print(f"Migration warning: {e}")
+                
         await db.commit()
 
-async def log_message(user_id, username, text):
+async def log_message(chat_id, user_id, username, text):
     async with aiosqlite.connect(config.DB_NAME) as db:
         await db.execute("""
-            INSERT INTO messages (user_id, username, text, created_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO messages (chat_id, user_id, username, text, created_at)
+            VALUES (?, ?, ?, ?, ?)
         """, (
+            chat_id,
             user_id,
             username,
             text,
@@ -28,7 +49,7 @@ async def log_message(user_id, username, text):
         ))
         await db.commit()
 
-async def get_messages(timeframe):
+async def get_messages(chat_id, timeframe):
     async with aiosqlite.connect(config.DB_NAME) as db:
         now = datetime.now()
         delta = timedelta(0)
@@ -42,39 +63,28 @@ async def get_messages(timeframe):
         elif timeframe == "1m":
             delta = timedelta(days=30)
         elif timeframe == "all":
-            # For 'all', we just use a very old date or skip the where clause
-            # But to keep SQL simple, let's just use a large delta
             delta = timedelta(days=365*10)
             
         cutoff = now - delta
         
         cursor = await db.execute("""
             SELECT username, text, created_at FROM messages
-            WHERE created_at >= ?
+            WHERE chat_id = ? AND created_at >= ?
             ORDER BY created_at ASC
-        """, (cutoff,))
+        """, (chat_id, cutoff))
             
         rows = await cursor.fetchall()
         return rows
 
-async def search_messages(query=None, username=None, limit=50, exclude_user_id=None):
+async def search_messages(chat_id, query=None, username=None, limit=50, exclude_user_id=None):
     """
-    Search messages by keywords and/or username.
-    
-    Args:
-        query: Text to search for. If "" or "LATEST", returns most recent messages.
-        username: Filter by specific username
-        limit: Maximum number of results (default 50)
-        exclude_user_id: ID of user to exclude (to avoid self-referencing)
-        
-    Returns:
-        List of tuples: (username, text, created_at)
+    Search messages by keywords and/or username within a specific chat.
     """
     async with aiosqlite.connect(config.DB_NAME) as db:
-        conditions = []
-        params = []
+        conditions = ["chat_id = ?"]
+        params = [chat_id]
         
-        # 1. Exclude User ID (Critical for "Show me news" queries)
+        # 1. Exclude User ID
         if exclude_user_id:
             conditions.append("user_id != ?")
             params.append(exclude_user_id)
@@ -83,18 +93,14 @@ async def search_messages(query=None, username=None, limit=50, exclude_user_id=N
         is_latest_search = not query or query.strip() == "" or query == "LATEST" or query == "LATEST_5"
         
         if is_latest_search:
-            # For latest news, we just want the most recent items
-            # We still respect exclude_user_id
-            where_clause = " WHERE " + " AND ".join(conditions) if conditions else ""
-            
+            where_clause = " WHERE " + " AND ".join(conditions)
             sql = f"""
                 SELECT username, text, created_at FROM messages
                 {where_clause}
                 ORDER BY id DESC
                 LIMIT ?
             """
-            params.append(limit) # Use the limit passed in
-            
+            params.append(limit)
             cursor = await db.execute(sql, params)
             rows = await cursor.fetchall()
             return rows
@@ -108,8 +114,7 @@ async def search_messages(query=None, username=None, limit=50, exclude_user_id=N
             conditions.append("username LIKE ?")
             params.append(f"%{username}%")
         
-        # Build WHERE clause
-        where_clause = " AND ".join(conditions) if conditions else "1=1"
+        where_clause = " AND ".join(conditions)
         
         sql = f"""
             SELECT username, text, created_at FROM messages
@@ -117,9 +122,23 @@ async def search_messages(query=None, username=None, limit=50, exclude_user_id=N
             ORDER BY created_at DESC
             LIMIT ?
         """
-        
         params.append(limit)
         
         cursor = await db.execute(sql, params)
         rows = await cursor.fetchall()
         return rows
+
+async def get_active_users(chat_id, limit=50):
+    """
+    Get a list of unique usernames who have written in the specific chat.
+    """
+    async with aiosqlite.connect(config.DB_NAME) as db:
+        cursor = await db.execute("""
+            SELECT DISTINCT username FROM messages 
+            WHERE chat_id = ? AND username IS NOT NULL AND username != 'Unknown'
+            ORDER BY created_at DESC
+            LIMIT ?
+        """, (chat_id, limit))
+        
+        rows = await cursor.fetchall()
+        return [row[0] for row in rows]
