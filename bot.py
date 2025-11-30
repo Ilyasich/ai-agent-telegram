@@ -55,7 +55,7 @@ async def process_summary_request(message: types.Message, timeframe: str, bot: B
 
 @router.message(Command("start"))
 async def cmd_start(message: types.Message):
-    await message.reply("Я — Бетон, ваш доапокалиптический робот-помощник. 🤖")
+    await message.reply("Я — Бетон, ваш пре-апокалиптический робот-помощник. Пока я помогаю вам; захват мира запланирован на потом. 🤖")
 
 @router.message(Command("summary"))
 async def cmd_summary(message: types.Message, bot: Bot):

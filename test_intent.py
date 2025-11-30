@@ -25,6 +25,11 @@ async def test_intent_detection():
         ("Hello", "chat", None),
         ("What can you do?", "chat", None),
         ("Help me", "chat", None),
+        
+        # User search requests
+        ("What did Alice say?", "search", None),
+        ("Show messages from Bob", "search", None),
+        ("Any updates from @charlie?", "search", None),
     ]
     
     print("Testing Intent Detection\n" + "="*50)
@@ -40,6 +45,9 @@ async def test_intent_detection():
                 if expected_timeframe:
                     match = result.get('timeframe') == expected_timeframe
                     print(f"✓ Correct" if match else f"✗ Expected {expected_timeframe}")
+            elif result['action'] == 'search':
+                print(f"Keywords: '{result.get('keywords', '')}'")
+                print(f"Username: '{result.get('username', 'None')}'")
             elif result['action'] == 'chat':
                 print(f"Reply: {result.get('reply', 'N/A')[:100]}...")
                 
@@ -53,8 +61,8 @@ async def test_intent_detection():
 
 if __name__ == "__main__":
     # Check if API key is set
-    if not os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY") == "mock_key":
-        print("⚠️  OPENAI_API_KEY not set. This test requires a valid API key.")
+    if not os.getenv("GROQ_API_KEY") and not os.getenv("OPENAI_API_KEY"):
+        print("⚠️  GROQ_API_KEY or OPENAI_API_KEY not set. This test requires a valid API key.")
         print("Set it in your .env file or export it as an environment variable.")
     else:
         asyncio.run(test_intent_detection())
