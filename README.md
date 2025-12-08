@@ -1,5 +1,7 @@
 # AI Meeting Assistant Telegram Bot
 
+This project is under development.
+
 A production-ready Telegram bot that logs group chat messages, generates AI-powered summaries, and delivers them as PDF reports with Cyrillic support.
 
 ## Features
