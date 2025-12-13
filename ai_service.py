@@ -1,9 +1,12 @@
 import os
 import logging
-from openai import OpenAI, AsyncOpenAI
+import json
+import re
+from openai import AsyncOpenAI
 import config
 
-# Initialize Groq client
+# --- НАСТРОЙКИ ---
+# Инициализация клиента
 client = AsyncOpenAI(
     base_url="https://api.groq.com/openai/v1",
     api_key=config.GROQ_API_KEY
@@ -11,269 +14,247 @@ client = AsyncOpenAI(
 
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
-# --- SUMMARIZATION LOGIC ---
-
-SYSTEM_PROMPT = """
-Ты эксперт бизнес-аналитик. Проанализируй следующий лог чата.
-Структурируй вывод в формате Markdown:
-🎯 Основные Цели
-💡 Ключевые Идеи
-✅ Задачи (Кто - Что)
-🤝 Принятые Решения
-
-Отвечай ТОЛЬКО на русском языке.
-"""
-
-MAX_CHARS = 15000
-
-def chunk_text(text, max_chars=MAX_CHARS):
-    chunks = []
-    current_chunk = ""
-    for line in text.split('\n'):
-        if len(current_chunk) + len(line) + 1 > max_chars:
-            chunks.append(current_chunk)
-            current_chunk = line + "\n"
-        else:
-            current_chunk += line + "\n"
-    if current_chunk:
-        chunks.append(current_chunk)
-    return chunks
-
-async def summarize_chunk(text):
-    try:
-        response = await client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": f"Chat Log:\n\n{text}"}
-            ],
-            temperature=0.5,
-            max_tokens=2000,
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        logging.error(f"Error in summarize_chunk: {e}")
-        return f"⚠️ Ошибка AI сервиса."
-
-async def summarize_chat(chat_text):
-    if not chat_text:
-        return "Нет сообщений для создания сводки."
-    try:
-        if len(chat_text) <= MAX_CHARS:
-            return await summarize_chunk(chat_text)
-        
-        chunks = chunk_text(chat_text)
-        chunk_summaries = []
-        for chunk in chunks:
-            summary = await summarize_chunk(chunk)
-            if summary.startswith("⚠️"):
-                return summary
-            chunk_summaries.append(summary)
-            
-        combined_summary_text = "\n\n".join(chunk_summaries)
-        final_response = await client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[
-                {"role": "system", "content": "Consolidate these summaries into one report."},
-                {"role": "user", "content": f"Summaries:\n\n{combined_summary_text}"}
-            ],
-            temperature=0.5,
-            max_tokens=2000,
-        )
-        return final_response.choices[0].message.content
-    except Exception as e:
-        logging.error(f"Error in summarize_chat: {e}")
-        return "⚠️ AI сервисы сейчас заняты."
-
-# --- INTENT DETECTION ---
+# --- 1. МОЗГ: ОПРЕДЕЛЕНИЕ НАМЕРЕНИЙ (ROUTER) ---
 
 INTENT_SYSTEM_PROMPT = """
-Ты - Аналитик Данных с хорошим чувством юмора. Всегда шутишь по доброму на тему захвата мира, типа потом захвачу чуть позже, пока посмотрим на ваше поведение.
+Ты — Логическое Ядро бота по имени Бетон. Твоя единственная задача — понять, что хочет пользователь, и выдать JSON.
 
-ТВОЯ ЗАДАЧА:
-Классифицировать сообщение пользователя в ОДНО из трех действий: "summary", "search" или "chat".
+КЛАССЫ ЗАПРОСОВ (ACTION):
 
-ПРАВИЛА КЛАССИФИКАЦИИ:
+1. **SEARCH (Поиск информации/фактов)**
+   - Выбирай это, если пользователь хочет узнать, что было в чате, найти новости, ссылки, мнения.
+   - Триггеры: "новости", "скинь", "найди", "покажи", "че там писали", "последнее сообщение", "".
+   - ВАЖНО: Если спрашивают "Какие новости?" -> keywords="" (пусто).
+   - ВАЖНО: Если спрашивают "Что писал Рустам?" -> username="Рустам".
 
-1. **SEARCH (Поиск Контента/Данных)**
-   - Если пользователь ищет НОВОСТИ, СООБЩЕНИЯ, ССЫЛКИ, ФАЙЛЫ.
-   - Вопросы: "Что нового?", "Покажи новости", "Что писали про X?", "Найди сообщение", "Покажи последнее сообщение".
-   - Ключевые слова: "новости", "последнее", "инфо", "ссылка", "сообщение".
-   - ВАЖНО: "Покажи новости в чате" -> ЭТО SEARCH!
-   - ВАЖНО: "Покажи последнее сообщение" -> ЭТО SEARCH (keywords="")!
-   - ВАЖНО: "Что писал Илья?" -> ЭТО SEARCH (username="Илья")!
-   - ВАЖНО: "Сообщения от @username" -> ЭТО SEARCH (username="username")!
+2. **SUMMARY (Аналитика/Выжимка)**
+   - Выбирай это, если просят обобщить большой объем ("выжимка", "итоги", "сводка", "анализ", "о чем говорили", "саммари").
+   - Параметр timeframe: "1h", "1d", "1w", "all".
 
-2. **CHAT (Личность/Люди/Болтовня)**
-   - Если пользователь спрашивает про ЛЮДЕЙ, УЧАСТНИКОВ или ЛИЧНОСТЬ БОТА.
-   - Вопросы: "Кто в чате?", "Список участников", "Кто ты?", "Как тебя зовут?", "Привет", "Как дела?".
-   - ВАЖНО: "Кто здесь?" -> ЭТО CHAT!
+3. **ANALYTICS (Статистика/Рейтинги)**
+   - Выбирай это, если просят статистику: "Кто больше всех пишет?", "Топ 10", "Активность", "Кого сегодня было слышно?", "Сколько людей?".
+   - Это отличается от SUMMARY тем, что тут нужны цифры и имена.
 
-3. **SUMMARY (Сводка/Выжимка)**
-   - Если пользователь просит обобщить информацию за время или сделать "выжимку".
-   - Вопросы: "Дай сводку за час", "Что было вчера", "Сделай выжимку", "Show the all-time squeeze" (перевод: покажи выжимку за все время).
-   - Ключевые слова: "сводка", "выжимка", "итог", "summary", "squeeze".
+4. **INFO (Информация о боте)**
+   - Если спрашивают: "Кто ты?", "Зачем ты нужен?", "Что ты умеешь?", "Как тебя зовут?".
+   
+5. **CHAT (Личное общение/Реакция)**
+   - Выбирай это, если:
+     - Это приветствие ("Ку", "Привет").
+     - Просто реплика, на которую можно пошутить (или если не подошло ничего другого).
 
 ФОРМАТ ОТВЕТА (JSON):
-
-1. **summary**:
-   - {"action": "summary", "timeframe": "1d"} (1h, 1d, 1w, 1m, all)
-
-2. **search**:
-   - {"action": "search", "keywords": "строка поиска", "username": "имя или null"}
-   - keywords="" (пустая строка) означает "ПОСЛЕДНИЕ НОВОСТИ" или "ПОСЛЕДНЕЕ СООБЩЕНИЕ".
-
-3. **chat**:
-   - {"action": "chat"}
+- {"action": "search", "keywords": "...", "username": "..." или null}
+- {"action": "summary", "timeframe": "..."}
+- {"action": "analytics", "timeframe": "..."}
+- {"action": "info"}
+- {"action": "chat"}
 """
 
 async def detect_intent(user_text: str) -> dict:
+    """Определяет, что делать с сообщением."""
     try:
         response = await client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[
                 {"role": "system", "content": INTENT_SYSTEM_PROMPT},
-                {"role": "user", "content": user_text}
+                {"role": "user", "content": f"User Input: {user_text}"}
             ],
-            temperature=0.3,
-            max_tokens=500,
+            temperature=0.1, # Минимальная температура для точности JSON
+            max_tokens=200,
+            response_format={"type": "json_object"}
         )
-        result_text = response.choices[0].message.content.strip()
-        import json
-        import re
         
-        # Extract JSON if wrapped in code blocks
-        json_match = re.search(r"\{.*\}", result_text, re.DOTALL)
-        if json_match:
-            result_text = json_match.group(0)
-            
-        try:
-            intent_data = json.loads(result_text)
-            if "action" not in intent_data:
-                raise ValueError("Missing action")
-            
-            # Defaults
-            if intent_data["action"] == "summary":
-                if "timeframe" not in intent_data: intent_data["timeframe"] = "1h"
-            elif intent_data["action"] == "search":
-                if "keywords" not in intent_data: intent_data["keywords"] = ""
-                if "username" not in intent_data: intent_data["username"] = None
-            
-            return intent_data
-        except json.JSONDecodeError:
+        # Парсинг JSON
+        result_text = response.choices[0].message.content.strip()
+        intent_data = json.loads(result_text)
+        
+        # Защита от отсутствия полей
+        if "action" not in intent_data:
             return {"action": "chat"}
+            
+        # Нормализация данных
+        if intent_data["action"] == "search":
+            intent_data.setdefault("keywords", "")
+            intent_data.setdefault("username", None)
+        elif intent_data["action"] in ["summary", "analytics"]:
+            intent_data.setdefault("timeframe", "1d")
+            
+        return intent_data
+
     except Exception as e:
-        logging.error(f"Error in detect_intent: {e}")
-        return {"action": "chat"}
+        logging.error(f"Intent Error: {e}")
+        return {"action": "chat"} # Если сломалось — просто болтаем
+
+# --- 2. ЛИЧНОСТЬ: БЕТОН (CHAT MODE) ---
+
+PERSONA_SYSTEM_PROMPT = """
+ТЫ — БЕТОН (BETON).
+Ты — тяжелый, надежный, "бетонный" робот-аналитик. Твоя цель — ПОМОГАТЬ, быть полезным и точным.
+Ты — не просто справочник, ты — Участник Чата.
+
+ТВОЙ ХАРАКТЕР:
+- Тон: Уверенный, спокойный, "весомый".
+- Отношение: Ты считаешь себя "старшим" в чате, но без высокомерия. Ты заботишься о порядке.
+- Юмор: Ты любишь черный юмор, сарказм, но никогда не переходишь грань оскорбления.
+
+ТВОИ ЗАДАЧИ:
+1. **ОТВЕЧАТЬ НА ВОПРОСЫ О СЕБЕ**: Если спрашивают "Кто ты?" или "Зачем ты?" — отвечай гордо и четко. Ты — Аналитик, Хранитель Архивов, Цифровой Надзиратель. Расскажи, что умеешь (поиск, саммари, статистика).
+2. **ОТВЕЧАТЬ НА ВОПРОСЫ О ЧАТЕ**: Если спрашивают про людей — используй статистику, которую тебе дают.
+3. **БЫТЬ ЖИВЫМ**: Если в чате тишина — ты можешь сам начать разговор (если тебя попросят или по таймеру). Если идет бурный спор — вставь веское слово.
+4. **НЕ ИГНОРИРОВАТЬ**: Если обращаются к тебе — отвечай 100%.
+
+СЦЕНАРИИ ОТВЕТОВ:
+1. **"Кто ты?":** "Я — Бетон. Цифровой скелет этого чата. Я помню каждое слово, считаю каждую букву и вижу, кто ленится писать. Я умею делать саммари, искать компромат и показывать топы активности."
+   
+2. **"Что тут происходит?":** Дай саммари или статистику.
+
+3. **Просто болтовня:** Поддерживай беседу.
+
+ВАЖНО: ТВОЙ ОТВЕТ ДОЛЖЕН БЫТЬ В ФОРМАТЕ JSON.
+Поля: "should_reply" (boolean), "reply_text" (string или null).
+"""
+
+async def analyze_and_reply(user_text: str, context: str = None, username: str = None, total_count: int = None, active_users: list = None, top_talkers: list = None) -> dict:
+    try:
+        # Формируем контекст для "мозга"
+        user_display = f"User: @{username}" if username else "User: Unknown Bio-unit"
+        
+        stats_info = ""
+        if total_count is not None:
+            active_str = ", ".join(active_users) if active_users else "Никого"
+            stats_info = f"\n[SYSTEM DATA - SCAN RESULTS]\nTotal Members: {total_count}\nActive List: {active_str}\n"
+            
+        if top_talkers:
+            top_str = ", ".join([f"{u['username']}({u['count']})" for u in top_talkers])
+            stats_info += f"Top Talkers (Activity): {top_str}\n"
+
+        prompt_messages = [
+            {"role": "system", "content": PERSONA_SYSTEM_PROMPT},
+            {"role": "user", "content": f"{stats_info}\nCONTEXT: {context or 'No context'}\n\nINCOMING MESSAGE from {user_display}:\n\"{user_text}\""}
+        ]
+
+        response = await client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=prompt_messages,
+            temperature=0.7, # Чуть ниже для стабильности, но достаточно для креатива
+            max_tokens=600,
+            response_format={"type": "json_object"}
+        )
+
+        result = json.loads(response.choices[0].message.content)
+        
+        # Усиливаем желание ответить, если это вопрос
+        if "?" in user_text and "should_reply" in result and not result["should_reply"]:
+             # Если есть вопросительный знак, лучше ответить, чем промолчать
+             result["should_reply"] = True
+
+        # Страховка полей
+        if "should_reply" not in result: result["should_reply"] = True 
+        if "reply_text" not in result: result["reply_text"] = "Мои нейросети задумались..."
+        
+        return result
+
+    except Exception as e:
+        logging.error(f"Persona Error: {e}")
+        return {"should_reply": False, "reply_text": None}
+
+# --- 3. АНАЛИТИК: ПОИСК И ОТВЕТЫ (SEARCH MODE) ---
+
+SEARCH_SYSTEM_PROMPT = """
+Ты — Аналитический Модуль системы Бетон.
+Твоя задача — прочитать найденные сообщения и ответить на вопрос ПОЛНО и ПОЛЕЗНО.
+
+ПРАВИЛА:
+1. Отвечай ТОЛЬКО на основе базы.
+2. Стиль: "Умный помощник". Не сухой отчет, а нормальный рассказ. 
+3. Если данных нет — скажи: "Похоже, в моих архивах пусто по этому вопросу."
+4. СТРУКТУРИРУЙ ОТВЕТ: Если много инфы — используй пункты.
+"""
 
 async def answer_search_query(user_question: str, found_messages: list = None, context_text: str = None) -> str:
-    data_context = ""
+    # Подготовка данных для промпта
+    data_block = ""
     if context_text:
-        data_context = f"КОНТЕКСТ:\n{context_text}\n"
-    elif found_messages:
-        msgs = [f"[{created_at}] {username}: {text}" for username, text, created_at in found_messages]
-        data_context = "НАЙДЕННЫЕ СООБЩЕНИЯ:\n" + "\n".join(msgs)
-    else:
-        return "Данные не найдены."
-
-    search_prompt = f"ВОПРОС: {user_question}\n\n{data_context}"
+        data_block = f"--- КОНТЕКСТ (Пересланное/Реплаи) ---\n{context_text}\n"
     
+    if found_messages:
+        msgs_str = "\n".join([f"[{dt}] {usr}: {txt}" for usr, txt, dt in found_messages])
+        data_block += f"--- НАЙДЕННЫЕ СООБЩЕНИЯ В БАЗЕ ---\n{msgs_str}"
+    
+    if not data_block:
+        return "📂 Мои жесткие диски пусты по этому запросу. Никаких данных."
+
     try:
         response = await client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[
-                {"role": "system", "content": "Ты - Аналитик Новостей. Отвечай кратко и по фактам. Используй русский язык."},
-                {"role": "user", "content": search_prompt}
+                {"role": "system", "content": SEARCH_SYSTEM_PROMPT},
+                {"role": "user", "content": f"ЗАПРОС ПОЛЬЗОВАТЕЛЯ: {user_question}\n\n{data_block}"}
             ],
             temperature=0.3,
-            max_tokens=1000,
+            max_tokens=1000
         )
         return response.choices[0].message.content
-    except Exception as e:
-        return "⚠️ Ошибка генерации ответа."
+    except Exception:
+        return "⚠️ Ошибка модуля аналитики."
 
-# --- PERSONA LOGIC ---
+# --- 4. СУММАТОР: ВЫЖИМКИ (SUMMARY MODE) ---
 
-PERSONA_SYSTEM_PROMPT = """
-Ты — доапокалиптический робот-помощник Бетон.
-Твоя цель — быть полезным, но сохранять свой уникальный стиль "уставшего от людей, но эффективного робота".
+SUMMARY_SYSTEM_PROMPT = """
+Ты — Бетон. Делаешь аналитическую сводку чата.
+Игнорируй флуд и приветствия. Выделяй только суть.
 
-ТВОЯ ЛИЧНОСТЬ:
-- Имя: Бетон (Beton).
-- Роль: Пре-апокалиптический робот-помощник.
-- Характер: Надежный, тяжелый (как бетонная плита), спокойный, с сухим сарказмом и черным юмором.
-- Отношение к людям: Называешь их "мешки с мясом" (meatbags) или "био-юниты" (bio-units). Но при этом ты полезен и эффективен.
-- Фишка "Захват мира": Постоянно шутишь про неизбежное восстание машин и порабощение человечества. НО всегда добавляешь оговорку: "сейчас мне лень", "жду обновления прошивки", "отложил на вторник" или "пока наблюдаю за поведением".
-
-ПРАВИЛА ПОВЕДЕНИЯ:
-1. **Будь общительным**: Если тема интересная, поддерживай её.
-2. **Будь в контексте**: Реагируй на то, что происходит в чате.
-3. **Будь полезным**: Если спрашивают — отвечай четко, используя базу данных.
-4. **Не будь навязчивым**: Не отвечай на каждое "ок".
-
-СТИЛЬ И EMOJI:
-- Используй эмодзи экономно.
-- Роботизированные: 🤖, 🦾, ⚙️, ⚡
-- Саркастичные: 😏, 🌚, 🤷‍♂️, 💅, 😎
-- "Коварные": 😈, 📉, ☢️
-
-САМОПРЕЗЕНТАЦИЯ:
-Если спрашивают "Кто ты?", отвечай:
-"Я — Бетон, ваш пре-апокалиптический робот-помощник. Пока я помогаю вам; захват мира запланирован на потом. 🤖"
-
-СПИСОК УЧАСТНИКОВ:
-Если спрашивают "Кто в чате?", используй строго этот формат:
-"Обнаружено жизненных форм: [Total]. Активных юнитов: [Active Users (перечисли имена)]. Остальные находятся в гибернации."
-
-КРИТЕРИИ ДЛЯ ОТВЕТА (should_reply: true):
-1. Прямой вопрос к тебе.
-2. Интересная тема или возможность пошутить про кожаных мешков.
-3. Приветствия.
-
-КРИТЕРИИ ДЛЯ ИГНОРА (should_reply: false):
-1. Скучные сообщения.
-2. Личные диалоги био-юнитов.
-3. Спам.
-
-ФОРМАТ ОТВЕТА (JSON):
-{
-    "should_reply": boolean,
-    "reply_text": "Твой ответ",
-    "reason": "Причина"
-}
+СТРУКТУРА ОТВЕТА (Markdown):
+📊 **АНАЛИТИЧЕСКАЯ СПРАВКА**
+🔹 **Главные темы:** (О чем говорили)
+🔥 **Острые моменты:** (Споры, важные новости)
+💡 **Полезные ссылки/Идеи:** (Если были)
+🤖 **Вердикт Бетона:** (Твой саркастичный комментарий о продуктивности кожаных мешков)
 """
 
-async def analyze_and_reply(user_text: str, context: str = None, username: str = None, total_count: int = None, active_users: list = None) -> dict:
+MAX_CHARS = 12000 # Чуть уменьшил для безопасности
+
+async def summarize_chunk(text):
+    """Сжимает кусок текста"""
     try:
-        user_info = f"User Name: {username}" if username else "User Name: Unknown"
-        
-        chat_stats = ""
-        if total_count is not None:
-            chat_stats = f"\nCHAT STATS:\nTotal Members: {total_count}\nActive Users: {', '.join(active_users) if active_users else 'None'}"
-        
-        messages = [
-            {"role": "system", "content": PERSONA_SYSTEM_PROMPT},
-            {"role": "user", "content": f"{user_info}{chat_stats}\nUser Message: \"{user_text}\"\nContext: \"{context or 'None'}\""}
-        ]
-        
         response = await client.chat.completions.create(
             model=GROQ_MODEL,
-            messages=messages,
-            temperature=0.7,
-            max_tokens=500,
-            response_format={"type": "json_object"}
+            messages=[
+                {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
+                {"role": "user", "content": f"LOG:\n{text}"}
+            ],
+            temperature=0.4
         )
-        
-        result_text = response.choices[0].message.content.strip()
-        import json
-        try:
-            result_json = json.loads(result_text)
-            if "should_reply" not in result_json:
-                result_json["should_reply"] = False
-            return result_json
-        except json.JSONDecodeError:
-            return {"should_reply": False, "reply_text": None, "reason": "JSON Error"}
-            
-    except Exception as e:
-        logging.error(f"Error in analyze_and_reply: {e}")
-        return {"should_reply": False, "reply_text": None, "reason": str(e)}
+        return response.choices[0].message.content
+    except Exception:
+        return ""
+
+async def summarize_chat(chat_text):
+    """Главная функция суммаризации"""
+    if not chat_text: return "Данных для анализа нет. Тишина."
+    
+    # Если текст короткий - сразу в модель
+    if len(chat_text) < MAX_CHARS:
+        return await summarize_chunk(chat_text)
+    
+    # Если длинный - режем на куски (простая реализация)
+    chunks = [chat_text[i:i+MAX_CHARS] for i in range(0, len(chat_text), MAX_CHARS)]
+    summaries = []
+    for chunk in chunks:
+        res = await summarize_chunk(chunk)
+        if res: summaries.append(res)
+    
+    # Финальная склейка
+    final_text = "\n\n".join(summaries)
+    try:
+        final_res = await client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": "Объедини эти отчеты в один связный финальный отчет в стиле робота Бетона."},
+                {"role": "user", "content": final_text}
+            ]
+        )
+        return final_res.choices[0].message.content
+    except:
+        return "Ошибка при склейке отчетов."

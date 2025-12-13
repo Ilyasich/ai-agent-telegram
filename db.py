@@ -19,32 +19,44 @@ async def init_db():
                 user_id INTEGER,
                 username TEXT,
                 text TEXT,
+                reply_to_user_id INTEGER,
+                reply_to_username TEXT,
                 created_at DATETIME
             )
         """)
         
-        # Optional: Check if chat_id column exists (simple migration)
+        # Migrations for existing tables
         try:
             await db.execute("SELECT chat_id FROM messages LIMIT 1")
         except Exception:
-            # Column likely missing, try to add it
             try:
                 await db.execute("ALTER TABLE messages ADD COLUMN chat_id INTEGER")
             except Exception as e:
-                print(f"Migration warning: {e}")
+                print(f"Migration warning (chat_id): {e}")
+
+        try:
+            await db.execute("SELECT reply_to_user_id FROM messages LIMIT 1")
+        except Exception:
+            try:
+                await db.execute("ALTER TABLE messages ADD COLUMN reply_to_user_id INTEGER")
+                await db.execute("ALTER TABLE messages ADD COLUMN reply_to_username TEXT")
+            except Exception as e:
+                print(f"Migration warning (reply_columns): {e}")
                 
         await db.commit()
 
-async def log_message(chat_id, user_id, username, text):
+async def log_message(chat_id, user_id, username, text, reply_to_user_id=None, reply_to_username=None):
     async with aiosqlite.connect(config.DB_NAME) as db:
         await db.execute("""
-            INSERT INTO messages (chat_id, user_id, username, text, created_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO messages (chat_id, user_id, username, text, reply_to_user_id, reply_to_username, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (
             chat_id,
             user_id,
             username,
             text,
+            reply_to_user_id,
+            reply_to_username,
             datetime.now()
         ))
         await db.commit()
@@ -142,3 +154,30 @@ async def get_active_users(chat_id, limit=50):
         
         rows = await cursor.fetchall()
         return [row[0] for row in rows]
+
+async def get_top_talkers(chat_id, timeframe="1d", limit=5):
+    """
+    Get top active users in the given timeframe.
+    """
+    async with aiosqlite.connect(config.DB_NAME) as db:
+        now = datetime.now()
+        delta = timedelta(days=1)
+        if timeframe == "1h": delta = timedelta(hours=1)
+        elif timeframe == "1w": delta = timedelta(weeks=1)
+        elif timeframe == "1m": delta = timedelta(days=30)
+        elif timeframe == "all": delta = timedelta(days=3650)
+            
+        cutoff = now - delta
+        
+        # Top speakers
+        cursor = await db.execute("""
+            SELECT username, COUNT(*) as count 
+            FROM messages 
+            WHERE chat_id = ? AND created_at >= ? AND username != 'Unknown' AND username IS NOT NULL
+            GROUP BY username 
+            ORDER BY count DESC 
+            LIMIT ?
+        """, (chat_id, cutoff, limit))
+        
+        rows = await cursor.fetchall()
+        return [{"username": r[0], "count": r[1]} for r in rows]
